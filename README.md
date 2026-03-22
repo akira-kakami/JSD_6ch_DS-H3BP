@@ -108,25 +108,60 @@ S_DISABLED ──────────→ S_IDLE
                           └──────────→ S_IDLE
 ```
 
-### センササンプリングタイミング
+### センササンプリングタイミング（詳細）
+
+以下は `SCLK_HALF_CNT = 2`（`SENSOR_CLK_US=2`, `CLK_FREQ_HZ=100MHz` → 実際は 199）の簡略例。
+周期番号は PLクロックの立ち上がりエッジを示す。
 
 ```
-PLclk:    __|‾|__|‾|__|‾|__|‾|__
-               A   B   C   D
+PL clk :  __|‾|__|‾|__|‾|__|‾|__|‾|__|‾|__|‾|__|‾|__|‾|__|‾|__
+周期    :    0   1   2   3   4   5   6   7   8   9  10  11  12
 
-sens_clk: ‾‾‾‾‾‾‾|_____________
-          (S_SHIFT末: clkA で CLK 落下指示)
-                  ↑
-              clkB 以降 CLK Low 確定
+state   :  [   S_CLK_LOW   ][     S_SHIFT      ][LAT][   S_CLK_LOW   ][S_SHIFT...
+sclk_cnt:    0   1   2          0   1   2              0   1   2
 
-SOUT:     ───[  Dn 有効  ]──────
-                    ↑
-              S_LATCH(clkB) でサンプル
-              ← CLK 立ち下がりの 1PL クロック後
+sens_clk:  _________________|‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾|_____________________
+                             ↑                 ↓
+                          CLK 立ち上がり     CLK 立ち下がり
+                         （周期2→3 の間）   （周期5→6 の間）
+                          ※ NBA が周期2     ※ NBA が周期5
+                            の posedge で      の posedge で
+                            sens_clk<=1 発行   sens_clk<=0 発行
+
+sens_sout: ──────[  Dn-1  ]──────────────────[  Dn  ]──────────────────
+                                  ↑                        ↑
+                          CLK立ち上がり後                CLK立ち上がり後
+                          センサが Dn 出力               センサが Dn+1 出力
+                          （#2ns 伝搬遅延後）             （#2ns 伝搬遅延後）
+
+SAMPLE  :                                     ↑ 周期6（S_LATCH）でサンプル
+                                              │ ← CLK立ち下がりの 1PLクロック後
+                                              └ shift_reg[ch][bit_idx] <= sens_sout[ch]
 ```
 
-- **D0〜D30 共通**: `S_SHIFT` で CLK を落とし → `S_LATCH` で 1PLクロック後にサンプル
-- センサは CLK 立ち上がりで次ビットを SOUT にセット、CLK 立ち下がり後に DUT がサンプル
+**フロー詳細（各周期の動作）:**
+
+| 周期 | state | sclk_cnt | sens_clk | 動作 |
+|---:|---|---:|:---:|---|
+| 0〜1 | S_CLK_LOW | 0〜1 | 0 | カウント中 |
+| 2 | S_CLK_LOW | 2 | 0 | `sens_clk <= 1` 発行・S_SHIFT へ |
+| 3 | S_SHIFT | 0 | **1** | CLK High 確定。センサが #2ns 後に Dn を SOUT へ出力 |
+| 4 | S_SHIFT | 1 | 1 | カウント中。SOUT = Dn 安定 |
+| 5 | S_SHIFT | 2 | 1 | `sens_clk <= 0` 発行・S_LATCH へ |
+| **6** | **S_LATCH** | ─ | **0** | **CLK Low 確定。`sens_sout` をサンプル → `shift_reg`** |
+| 7〜9 | S_CLK_LOW | 0〜2 | 0 | カウント中 |
+| 9 | S_CLK_LOW | 2 | 0 | `sens_clk <= 1` 発行・次ビットへ |
+
+**CLK 波形の対称性:**
+
+| 期間 | サイクル数（SCLK_HALF_CNT=N） | 備考 |
+|---|---|---|
+| CLK High（S_SHIFT） | N+1 サイクル | |
+| CLK Low（S_LATCH + S_CLK_LOW） | N+2 サイクル | S_LATCH の 1 サイクル分 Low が長い |
+
+- **D0〜D30 共通**: `S_SHIFT` で CLK を落とし → `S_LATCH`（1PLクロック後）でサンプル
+- センサは CLK 立ち上がり後に次ビットを SOUT へセット（伝搬遅延あり）
+- サンプル点では CLK が確実に Low 確定済みのため、センサ出力が安定している
 
 ---
 
