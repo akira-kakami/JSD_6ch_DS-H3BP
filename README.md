@@ -91,10 +91,13 @@ S_DISABLED ──────────→ S_IDLE
      │               S_MEAS（500μs カウント）
      │                    │ MES Low
      │                    ↓
-     │         ┌──→ S_SHIFT（CLK High 期間・末尾でサンプル）
-     │         │         │ sclk_cnt == SCLK_HALF_CNT
+     │         ┌──→ S_SHIFT（CLK High 期間カウント＆末尾で CLK 落下）
+     │         │         │ sclk_cnt == SCLK_HALF_CNT → CLK Low
      │         │         ↓
-     │         └──── S_CLK_LOW（CLK Low 期間）
+     │         │    S_LATCH（CLK 立ち下がりの 1 サイクル後にサンプル）
+     │         │         │ bit_idx < DATA_BITS-1
+     │         │         ↓
+     │         └──── S_CLK_LOW（CLK Low 期間・CLK 立ち上げ）
      │               （31bit 完了）
      │                    ↓
      │               S_TX（AXI-Stream beat 送出）
@@ -108,15 +111,22 @@ S_DISABLED ──────────→ S_IDLE
 ### センササンプリングタイミング
 
 ```
-MES:   ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾|_________________________
-CLK:   ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾|___|‾‾‾|___|‾‾‾|___
-SOUT:                      D0   D1       D2
-                              ↑           ↑
-                        CLK High末尾でサンプル（D0〜D30 共通）
+PLclk:    __|‾|__|‾|__|‾|__|‾|__
+               A   B   C   D
+
+sens_clk: ‾‾‾‾‾‾‾|_____________
+          (S_SHIFT末: clkA で CLK 落下指示)
+                  ↑
+              clkB 以降 CLK Low 確定
+
+SOUT:     ───[  Dn 有効  ]──────
+                    ↑
+              S_LATCH(clkB) でサンプル
+              ← CLK 立ち下がりの 1PL クロック後
 ```
 
-- **D0**: MES 立ち下がり後、CLK High 末尾でサンプル
-- **D1〜D30**: CLK 立ち上がり後、次の CLK High 末尾でサンプル
+- **D0〜D30 共通**: `S_SHIFT` で CLK を落とし → `S_LATCH` で 1PLクロック後にサンプル
+- センサは CLK 立ち上がりで次ビットを SOUT にセット、CLK 立ち下がり後に DUT がサンプル
 
 ---
 
