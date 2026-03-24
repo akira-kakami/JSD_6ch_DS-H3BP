@@ -28,31 +28,21 @@
 //
 // ■ sens_sout サンプリングタイミング
 //
-//   [D0] S_MEAS → S_LATCH_D0 → S_CLK_LOW
-//
-//     PLclk:    ... __|‾|__|‾|__|‾|__
-//                     A   B   C
-//     S_MEAS末:        sens_meas <= 0  (clkA更新)
-//     sens_meas:            ‾‾‾|_____  (clkA→B間にLOW確定)
-//     センサD0出力:               |←遅延→| D0有効
-//     S_LATCH_D0(clkB):    遷移のみ、サンプルなし
-//     S_WAIT_D0 (clkC):    sens_sout をサンプル  ← sens_meas落下から2PLクロック後
-//
-//   [D1〜D30] S_CLK_LOW → S_CLK_HIGH (sclk_cnt==SCLK_HALF_CNTでサンプル)
+//   [D0〜D30 共通] S_SHIFT → S_LATCH（CLK立ち下がりの1PLクロック後にサンプル）
 //
 //     PLclk:    ... __|‾|__|‾|__|‾|__|‾|__
 //                     A   B   C   D
-//     S_CLK_LOW末:     sens_clk <= 1  (clkA更新)
-//     sens_clk:             ‾‾‾‾‾‾‾‾‾  (clkA→B間にHIGH確定)
-//     センサSOUT応答:              |←遅延→| データ有効
-//     S_CLK_HIGH sclk_cnt==SCLK_HALF_CNT: sens_sout をサンプル（CLK立ち下がりと同サイクル）
+//     S_SHIFT末:       sens_clk <= 0  (clkA更新)
+//     sens_clk:              ‾‾‾|_______  (clkA→B間にLOW確定 = CLK立ち下がり)
+//     センサSOUT:                データ有効（CLK立ち上がり後にセンサがセット済み）
+//     S_LATCH (clkB):  sens_sout をサンプル  ← CLK立ち下がりの1PLクロック後
 //
 //   SENSOR_CLK_US >= 2 必須（最小CLK半周期 = 2μs → sclk_cnt最大値 >= 1）
 //
 // ■ パラメータ設定例（100MHz動作時）
 //   CLK_FREQ_HZ    = 100_000_000
 //   MEAS_TIME_US   = 500
-//   SENSOR_CLK_US  = 2          → CLK周期4μs, サンプルはCLK立ち上がりから20ns後
+//   SENSOR_CLK_US  = 2          → CLK周期4μs, サンプルはCLK立ち下がりから10ns後
 //   DATA_BITS      = 31
 //   NUM_CH         = 6
 //   INTER_MEAS_US  = 20
@@ -255,14 +245,15 @@ module ds_h3bp1_axi_stream #(
         S_DISABLED = 4'd0,  // 停止中（enable=0）
         S_IDLE     = 4'd1,  // 測定開始待ち（タイムスタンプラッチ → S_MEAS）
         S_MEAS     = 4'd2,  // 測定時間HIGH（全chセンサが内部カウント中）
-        S_SHIFT    = 4'd3,  // CLK HIGH末尾でサンプル＆CLK落下、全ビット共通
-        S_CLK_LOW  = 4'd4,  // センサCLK LOW期間（立ち上がりのみ、サンプルなし）
+        S_SHIFT    = 4'd3,  // CLK HIGH期間カウント＆末尾でCLK落下 → S_LATCH
+        S_CLK_LOW  = 4'd4,  // センサCLK LOW期間（半周期待機してCLK立ち上げ）
         S_TX       = 4'd5,  // AXI Stream beat送出
-        S_INTER    = 4'd6   // 次測定までインターバル
+        S_INTER    = 4'd6,  // 次測定までインターバル
+        S_LATCH    = 4'd7   // CLK立ち下がり後1サイクルでsens_soutをサンプル
     } state_t;
 
-    // サンプルタイミング: CLK HIGH末尾（立ち下がりと同サイクル）
-    // D0〜D30 全ビット共通: S_SHIFT の sclk_cnt==SCLK_HALF_CNT でサンプル
+    // サンプルタイミング: CLK立ち下がりの1PLクロック後（S_LATCH にて取得）
+    // D0〜D30 全ビット共通: S_SHIFT で CLK を落とし → S_LATCH でサンプル
 
     state_t state;
 
@@ -344,38 +335,42 @@ module ds_h3bp1_axi_stream #(
                 end
 
                 // ----------------------------------------------------------------
-                // S_SHIFT: CLK HIGH期間のカウント＆末尾でサンプル
+                // S_SHIFT: CLK HIGH期間のカウント＆末尾でCLK落下 → S_LATCH へ
                 //   D0〜D30 全ビット共通
-                //   sclk_cnt==SCLK_HALF_CNT: sens_sout をサンプル＆CLK立ち下がり
-                //   ・D0: MES立ち下がり後の最初のCLK HIGH末尾
-                //   ・D1〜D30: 各CLK立ち上がり後のCLK HIGH末尾
+                //   sclk_cnt==SCLK_HALF_CNT: CLK立ち下がり → S_LATCH へ遷移
                 // ----------------------------------------------------------------
                 S_SHIFT: begin
                     if (sclk_cnt == SCLK_HALF_CNT[$clog2(SCLK_HALF_CNT+1)-1:0]) begin
-                        // CLK HIGH末尾: 全ビット共通サンプル＆CLK落下
-                        for (int ch = 0; ch < NUM_CH; ch++)
-                            shift_reg[ch][bit_idx] <= sens_sout[ch];
-
+                        // CLK HIGH末尾: CLK落下 → 次サイクル(S_LATCH)でサンプル
                         sens_clk <= 1'b0;
                         sclk_cnt <= '0;
-
-                        if (bit_idx == (DATA_BITS - 1)) begin
-                            // 全31bit取得完了
-                            data_latch <= shift_reg;
-                            beat_idx   <= '0;
-                            state      <= S_TX;
-                        end else begin
-                            bit_idx <= bit_idx + 1'b1;
-                            state   <= S_CLK_LOW;
-                        end
+                        state    <= S_LATCH;
                     end else begin
                         sclk_cnt <= sclk_cnt + 1'b1;
                     end
                 end
 
                 // ----------------------------------------------------------------
+                // S_LATCH: CLK立ち下がりの1PLクロック後にsens_soutをサンプル
+                //   D0〜D30 全ビット共通
+                // ----------------------------------------------------------------
+                S_LATCH: begin
+                    for (int ch = 0; ch < NUM_CH; ch++)
+                        shift_reg[ch][bit_idx] <= sens_sout[ch];
+
+                    if (bit_idx == (DATA_BITS - 1)) begin
+                        // 全31bit取得完了
+                        data_latch <= shift_reg;
+                        beat_idx   <= '0;
+                        state      <= S_TX;
+                    end else begin
+                        bit_idx <= bit_idx + 1'b1;
+                        state   <= S_CLK_LOW;
+                    end
+                end
+
+                // ----------------------------------------------------------------
                 // S_CLK_LOW: CLK LOW期間（半周期待機してCLK立ち上げ → S_SHIFTへ）
-                //   サンプルなし
                 // ----------------------------------------------------------------
                 S_CLK_LOW: begin
                     if (sclk_cnt == SCLK_HALF_CNT[$clog2(SCLK_HALF_CNT+1)-1:0]) begin
@@ -443,6 +438,7 @@ module ds_h3bp1_axi_stream #(
     // =========================================================================
     assign busy = (state == S_MEAS    ||
                    state == S_SHIFT   ||
+                   state == S_LATCH   ||
                    state == S_CLK_LOW);
 
     generate
